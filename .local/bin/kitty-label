@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+LABELS_PATH = Path.home() / ".config/kitty/os-window-labels.json"
+LOCK_PATH = LABELS_PATH.with_suffix(".lock")
+
+
+def get_instance_pid():
+    pid = os.environ.get("KITTY_PID")
+
+    if not pid:
+        raise RuntimeError("KITTY_PID is not set. Run this command inside Kitty.")
+
+    return str(int(pid))
+
+
+def get_focused_os_window():
+    result = subprocess.run(
+        ["kitten", "@", "ls"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    windows = json.loads(result.stdout)
+
+    for window in windows:
+        if window.get("is_focused"):
+            return str(window["id"])
+
+    raise RuntimeError("No focused OS window found")
+
+
+def is_process_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (ValueError, OverflowError):
+        return False
+
+
+def read_labels():
+    try:
+        data = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def clean_dead_instances(labels):
+    return {
+        key: value
+        for key, value in labels.items()
+        if ":" in key and is_process_alive(key.split(":", 1)[0])
+    }
+
+
+def write_labels(labels):
+    fd, temp_path = tempfile.mkstemp(
+        dir=LABELS_PATH.parent,
+        prefix=".kitty-label-",
+    )
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(labels, f, ensure_ascii=False, indent=2)
+
+        os.replace(temp_path, LABELS_PATH)
+
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def set_os_label(label=None, reset=False, os_id=None):
+    pid = get_instance_pid()
+    os_id = os_id or get_focused_os_window()
+    key = f"{pid}:{os_id}"
+
+    LABELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(LOCK_PATH, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        labels = clean_dead_instances(read_labels())
+
+        if reset:
+            labels.pop(key, None)
+        else:
+            labels[key] = label
+
+        write_labels(labels)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kitty-label")
+    parser.add_argument("target", choices=("os", "tab", "window"))
+    parser.add_argument("name", nargs="?")
+    parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--id", dest="os_id")
+
+    args = parser.parse_args()
+
+    if args.target == "os":
+        if not args.reset and args.name is None:
+            parser.error("Specify a name or --reset")
+
+        set_os_label(
+            label=args.name,
+            reset=args.reset,
+            os_id=args.os_id,
+        )
+        return
+
+    if args.reset or args.os_id:
+        parser.error("--reset and --id are only supported for os")
+
+    if args.name is None:
+        parser.error("Specify a name")
+
+    command = (
+        "set-tab-title"
+        if args.target == "tab"
+        else "set-window-title"
+    )
+
+    subprocess.run(
+        ["kitten", "@", command, args.name],
+        check=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
